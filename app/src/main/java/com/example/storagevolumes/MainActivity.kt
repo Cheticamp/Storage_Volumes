@@ -1,5 +1,7 @@
 package com.example.storagevolumes
 
+// https://stackoverflow.com/questions/56663624/how-to-get-free-and-total-size-of-each-storagevolume
+
 import android.app.usage.StorageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -8,48 +10,38 @@ import android.os.Bundle
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
 import android.system.Os.statvfs
-import android.system.StructStatVfs
 import android.view.Gravity
 import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
-import java.io.File
 import java.util.*
 import kotlin.collections.HashSet
 import kotlin.math.roundToLong
-
 
 class MainActivity : AppCompatActivity() {
     private lateinit var mStorageManager: StorageManager
     private lateinit var mStorageVolumes: List<StorageVolume>
     private val mStorageVolumesByPath = HashMap<String, VolumeStats>()
-    private val mStorageVolumePathsWeHaveAccessTo = HashSet<Uri>()
+    private val mStorageVolumeWeHaveAccessTo = HashSet<Uri>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         mStorageManager = getSystemService(Context.STORAGE_SERVICE) as StorageManager
-        mStorageVolumes = mStorageManager.storageVolumes
-        for (storageVolume in mStorageVolumes) {
-            val path = storageVolume.getStorageVolumePath()
-            mStorageVolumesByPath[path] =
-                VolumeStats(
-                    mStorageVolume = storageVolume
-                )
-        }
+
+        getAccessibleVolumes()
         getVolumeStats()
         showVolumeStats()
 
         // Convenience button to release all access permissions for testing.
         releaseAccessButton.setOnClickListener {
-            getAccessibleVolumes()
 
             val takeFlags =
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            mStorageVolumePathsWeHaveAccessTo.forEach {
-                contentResolver.releasePersistableUriPermission(it, takeFlags)
+            mStorageVolumeWeHaveAccessTo.forEach { uri ->
+                contentResolver.releasePersistableUriPermission(uri, takeFlags)
             }
             val toast = Toast.makeText(
                 this,
@@ -58,68 +50,88 @@ class MainActivity : AppCompatActivity() {
             )
             toast.setGravity(Gravity.BOTTOM, 0, releaseAccessButton.height)
             toast.show()
+
+            getAccessibleVolumes()
             getVolumeStats()
             showVolumeStats()
+        }
+
+        swipeToRefresh.setOnRefreshListener {
+            getAccessibleVolumes()
+            getVolumeStats()
+            showVolumeStats()
+            swipeToRefresh.isRefreshing = false
         }
     }
 
     private fun getAccessibleVolumes() {
         val persistedUriPermissions = contentResolver.persistedUriPermissions
-        mStorageVolumePathsWeHaveAccessTo.clear()
+        mStorageVolumeWeHaveAccessTo.clear()
         persistedUriPermissions.forEach {
-            mStorageVolumePathsWeHaveAccessTo.add(it.uri)
+            mStorageVolumeWeHaveAccessTo.add(it.uri)
         }
     }
 
     private fun getVolumeStats() {
+        // Get our volumes
+        mStorageVolumes = mStorageManager.storageVolumes
+        mStorageVolumesByPath.clear()
 
-        mStorageVolumesByPath.forEach {
-            if (it.value.mStorageVolume.isPrimary) {
+        var totalSpace: Long
+        var usedSpace: Long
+        mStorageVolumes.forEach { storageVolume ->
+            val path: String = storageVolume.getStorageVolumePath()
+            if (storageVolume.isPrimary) {
+                // Special processing for primary volume. "Total" should equal size advertised
+                // on retail packaging and we get that from StorageStatsManager
                 val uuid = StorageManager.UUID_DEFAULT
                 val storageStatsManager =
                     getSystemService(Context.STORAGE_STATS_SERVICE) as StorageStatsManager
-                val totalPrimarySpace = storageStatsManager.getTotalBytes(uuid)
-                val primaryUsedSpace = totalPrimarySpace - storageStatsManager.getFreeBytes(uuid)
-                it.value.mTotalSpace = totalPrimarySpace
-                it.value.mUsedSpace = primaryUsedSpace
+                totalSpace = storageStatsManager.getTotalBytes(uuid)
+                usedSpace = totalSpace - storageStatsManager.getFreeBytes(uuid)
             } else {
-                val stats = getStatsFromPath(it.value.mStorageVolume.getStorageVolumePath())
+                // StorageStatsManager doesn't work for volumes other than the primary volume since
+                // the "UUID" available for non-primary volumes is not acceptable to
+                // StorageStatsManager. We must revert to statvfs(path) for non-primary volumes.
+                val stats = statvfs(storageVolume.getStorageVolumePath())
                 val blockSize = stats.f_bsize
-                val totalSpace = stats.f_blocks * blockSize
-                val usedSpace = totalSpace - stats.f_bavail * blockSize
-                it.value.mTotalSpace = totalSpace
-                it.value.mUsedSpace = usedSpace
+                totalSpace = stats.f_blocks * blockSize
+                usedSpace = totalSpace - stats.f_bavail * blockSize
             }
+            mStorageVolumesByPath[path] = VolumeStats(storageVolume, totalSpace, usedSpace)
         }
     }
 
     private fun showVolumeStats() {
         val sb = StringBuilder()
-        mStorageVolumesByPath.forEach {
-            val usedShiftUnits = getShiftUnits(it.value.mUsedSpace)
-            val totalShiftUnits = getShiftUnits(it.value.mTotalSpace)
-
-            val usedSpace = (100f * it.value.mUsedSpace / usedShiftUnits.first).roundToLong() / 100f
-            val totalSpace =
-                (100f * it.value.mTotalSpace / totalShiftUnits.first).roundToLong() / 100f
-            val desc = if (it.value.mStorageVolume.isPrimary) {
-                "Primary Storage"
-            } else {
-                it.value.mStorageVolume.getDescription(this)
-            }
-            sb.appendln("$desc(${it.key})")
-            sb.appendln(" Used space: ${usedSpace.nice()} ${usedShiftUnits.second}")
-            sb.appendln("Total space: ${totalSpace.nice()} ${totalShiftUnits.second}")
-            sb.appendln("----------------")
+        mStorageVolumesByPath.forEach { (path, volumeStats) ->
+            val (usedToShift, usedSizeUnits) = getShiftUnits(volumeStats.mUsedSpace)
+            val usedSpace = (100f * volumeStats.mUsedSpace / usedToShift).roundToLong() / 100f
+            val (totalToShift, totalSizeUnits) = getShiftUnits(volumeStats.mTotalSpace)
+            val totalSpace = (100f * volumeStats.mTotalSpace / totalToShift).roundToLong() / 100f
+            val volumeDescription =
+                if (volumeStats.mStorageVolume.isPrimary) {
+                    PRIMARY_STORAGE_LABEL
+                } else {
+                    volumeStats.mStorageVolume.getDescription(this)
+                }
+            sb.appendln("$volumeDescription ($path)")
+                .appendln(" Used space: ${usedSpace.nice()} $usedSizeUnits")
+                .appendln("Total space: ${totalSpace.nice()} $totalSizeUnits")
+                .appendln("----------------")
         }
         volumeStats.text = sb.toString()
-        if (mStorageVolumePathsWeHaveAccessTo.size > 0) {
-            releaseAccessButton.visibility = View.VISIBLE
-        }
+
+        releaseAccessButton.visibility =
+            if (mStorageVolumeWeHaveAccessTo.size > 0) {
+                View.VISIBLE
+            } else {
+                View.INVISIBLE
+            }
     }
 
     private fun getShiftUnits(x: Long): Pair<Float, String> {
-        var usedSpaceUnits: String? = null
+        val usedSpaceUnits: String
         val shift =
             when {
                 x < KB -> {
@@ -142,34 +154,37 @@ class MainActivity : AppCompatActivity() {
         return Pair(shift, usedSpaceUnits)
     }
 
-    private fun getStatsFromPath(path: String): StructStatVfs {
-        return statvfs(path)
-    }
-
     companion object {
         fun Float.nice(fieldLength: Int = 6): String =
-            java.lang.String.format(Locale.US, "%$fieldLength.2f", this)
+            String.format(Locale.US, "%$fieldLength.2f", this)
 
-        // StorageVolume should probably have a "getPath()" method that will do the following
-        // so we don't have to resort to reflection.
+        // StorageVolume should have an accessible "getPath()" method that will do
+        // the following so we don't have to resort to reflection.
         fun StorageVolume.getStorageVolumePath(): String {
-            val field = StorageVolume::class.java.getDeclaredField("mPath")
-            field.isAccessible = true
-            val f = field.get(this) as File
-            return f.toString()
+            return try {
+                javaClass
+                    .getMethod("getPath")
+                    .invoke(this) as String
+            } catch (e: Exception) {
+                e.printStackTrace()
+                ""
+            }
         }
 
         // These seem to be the values that work...
         const val KB = 1_000f
         const val MB = 1_000_000f
         const val GB = 1_000_000_000f
+
+        const val PRIMARY_STORAGE_LABEL = "Internal Storage"
+
         @Suppress("unused")
         const val TAG = "AppLog"
     }
 
     data class VolumeStats(
+        val mStorageVolume: StorageVolume,
         var mTotalSpace: Long = 0,
-        var mUsedSpace: Long = 0,
-        val mStorageVolume: StorageVolume
+        var mUsedSpace: Long = 0
     )
 }
